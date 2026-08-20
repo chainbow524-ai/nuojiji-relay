@@ -31,12 +31,68 @@ const DEFAULT_PROFILE = {
     randomLifeChancePerDay: 3,
 };
 
+function parseQuietHour(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value >= 0 && value < 24 ? value : null;
+    }
+
+    if (typeof value === 'string') {
+        const match = value.trim().match(/^(\d{1,2})(?::(\d{2}))?$/);
+        if (!match) return null;
+
+        const hours = Number(match[1]);
+        const minutes = Number(match[2] || 0);
+
+        if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+            return null;
+        }
+
+        return hours + minutes / 60;
+    }
+
+    return null;
+}
+
+function normalizeQuietRanges(quietHours) {
+    if (!quietHours) return [];
+
+    if (
+        Array.isArray(quietHours) &&
+        quietHours.length === 2 &&
+        !Array.isArray(quietHours[0]) &&
+        typeof quietHours[0] !== 'object'
+    ) {
+        return [quietHours];
+    }
+
+    if (Array.isArray(quietHours)) return quietHours;
+    if (Array.isArray(quietHours.ranges)) return quietHours.ranges;
+
+    return [quietHours];
+}
+
 function isQuietHour(hour, quietHours) {
-    if (!Array.isArray(quietHours) || quietHours.length !== 2) return false;
-    const [start, end] = quietHours;
-    if (start === end) return false;
-    if (start < end) return hour >= start && hour < end;
-    return hour >= start || hour < end;
+    const ranges = normalizeQuietRanges(quietHours);
+
+    return ranges.some((range) => {
+        const startValue = Array.isArray(range)
+            ? range[0]
+            : range?.start ?? range?.from ?? range?.startTime;
+
+        const endValue = Array.isArray(range)
+            ? range[1]
+            : range?.end ?? range?.to ?? range?.endTime;
+
+        const start = parseQuietHour(startValue);
+        const end = parseQuietHour(endValue);
+
+        if (start == null || end == null || start === end) return false;
+        if (start < end) return hour >= start && hour < end;
+
+        // 跨午夜，例如 23:00–11:00
+        return hour >= start || hour < end;
+    });
+}
 }
 
 function timeOfDayScore(hour, quietHours) {
@@ -89,7 +145,16 @@ export function calculateImpulse({
     const hour = (effectiveOff != null)
         ? new Date(now + effectiveOff * 1000).getUTCHours()
         : new Date(now).getHours();
-    const safetyFloorActive = isInSafetyFloor({ lifeState, lastInteractionAt, now, quietHours: p.quietHours, hour });
+        // 勿扰时段是硬限制：不计算冲动值，也不会进入后续 AI 生成流程。
+    if (isQuietHour(hour, p.quietHours)) {
+        return {
+            score: 0,
+            factors: { quietHoursHardSkip: true, localHour: hour },
+            reason: '[quiet hours hard skip]',
+            threshold: (typeof p.threshold === 'number') ? p.threshold : 0.55,
+            hardSkip: true,
+        };
+    }const safetyFloorActive = isInSafetyFloor({ lifeState, lastInteractionAt, now, quietHours: p.quietHours, hour });
 
     const sched = calculateScheduleEffect(scheduleCtx);
     if (sched.hardSkip && !safetyFloorActive) {
