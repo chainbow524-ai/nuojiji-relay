@@ -34,6 +34,88 @@ function fillTemplate(template, { transcript, reason, memory }) {
 //   （每个最长 180s）必然超时被杀 → 排后面的 pair 永不触发。给一个保守预算，超了就停，
 //   靠轮转游标下轮接着处理（pairsCursor）。Cloudflare 免费版 CPU 上限较紧，取 25s。
 const TICK_WALL_BUDGET_MS = 25_000;
+function parseQuietHour(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return value >= 0 && value < 24 ? value : null;
+    }
+
+    if (typeof value === 'string') {
+        const match = value.trim().match(/^(\d{1,2})(?::(\d{2}))?$/);
+        if (!match) return null;
+
+        const hours = Number(match[1]);
+        const minutes = Number(match[2] || 0);
+
+        if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+            return null;
+        }
+
+        return hours + minutes / 60;
+    }
+
+    return null;
+}
+
+function normalizeQuietRanges(quietHours) {
+    if (!quietHours || quietHours.enabled === false) return [];
+
+    if (
+        Array.isArray(quietHours) &&
+        quietHours.length === 2 &&
+        !Array.isArray(quietHours[0]) &&
+        typeof quietHours[0] !== 'object'
+    ) {
+        return [quietHours];
+    }
+
+    if (Array.isArray(quietHours)) return quietHours;
+    if (Array.isArray(quietHours.ranges)) return quietHours.ranges;
+
+    return [quietHours];
+}
+
+function isInQuietHours(now, rec) {
+    // 优先使用 App 单独上传的 quietHours；兼容旧记录中的 profile.quietHours。
+    const quietHours = rec.quietHours ?? rec.proactiveProfile?.quietHours;
+    const ranges = normalizeQuietRanges(quietHours);
+    if (!ranges.length) return false;
+
+    const charOffset = typeof rec.charUtcOffsetSeconds === 'number'
+        ? rec.charUtcOffsetSeconds
+        : null;
+
+    const userOffset = typeof rec.timeSpec?.userUtcOffsetSeconds === 'number'
+        ? rec.timeSpec.userUtcOffsetSeconds
+        : null;
+
+    const effectiveOffset = charOffset ?? userOffset;
+    const localDate = effectiveOffset != null
+        ? new Date(now + effectiveOffset * 1000)
+        : new Date(now);
+
+    const localHour = effectiveOffset != null
+        ? localDate.getUTCHours() + localDate.getUTCMinutes() / 60
+        : localDate.getHours() + localDate.getMinutes() / 60;
+
+    return ranges.some((range) => {
+        const startValue = Array.isArray(range)
+            ? range[0]
+            : range?.start ?? range?.from ?? range?.startTime;
+
+        const endValue = Array.isArray(range)
+            ? range[1]
+            : range?.end ?? range?.to ?? range?.endTime;
+
+        const start = parseQuietHour(startValue);
+        const end = parseQuietHour(endValue);
+
+        if (start == null || end == null || start === end) return false;
+        if (start < end) return localHour >= start && localHour < end;
+
+        // 跨午夜，例如 23:00–11:00。
+        return localHour >= start || localHour < end;
+    });
+}
 
 export async function runProactiveTick(env) {
     const proactive = await createProactiveStore(env);
@@ -94,6 +176,9 @@ export async function runProactiveTick(env) {
             //    权威判定在生成前用 claimFireIfStale 做 CAS（见下）。
             if (rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) continue;
 
+            // 勿扰是硬限制：两种主动模式都直接跳过，不调用 AI、不写 outbox、不发推送。
+if (isInQuietHours(now, rec)) continue;
+            
             // 两种触发档：'impulse'(真人模式) / 'interval'(普通后台主动，计时+概率高中低)
             let verdict;
             if (rec.mode === 'interval') {
