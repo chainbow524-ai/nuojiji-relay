@@ -123,21 +123,6 @@ export async function runProactiveTick(env) {
     const sub = await createSubStore(env);
     const now = nowMs();
     const tickStart = Date.now();
-
-    // 🔒 重入锁：Workers scheduled 无重入守卫，tick 超 60s 时下一轮 cron 会并发 → 同一 pair 双发双扣费。
-    //    抢不到锁（已有 tick 在跑）就直接退出本轮。锁带 TTL，tick 崩溃也会自动释放。
-    //    ⚠️ TTL 必须 ≥ 单 pair 最长耗时：tool-loop(≤25s 预算) + runGeneration(≤180s) + 余量 → 取 300s。
-    //    旧值 120s < 180s 生成 → 锁会在生成中途过期 → 下轮 cron 抢到锁并发 → 双发隐患复活。
-    //    （CAS claimFireIfStale 仍兜底防同一对双发，长锁是第二道防线 + 防多 pair 重叠空耗。）
-    const TICK_LOCK_TTL_MS = 300_000;
-    let lockHeld = false;
-    try { lockHeld = await proactive.acquireTickLock?.(TICK_LOCK_TTL_MS); } catch { lockHeld = true; /* 不支持锁的实现照旧跑 */ }
-    if (lockHeld === false) {
-        return { pairs: 0, fired: 0, skipped: 'locked' };
-    }
-
-    try {
-
     const allPairs = await proactive.listEnabled();
     // 🔄 轮转游标：从上轮停下的位置接着处理，保证规模化时每个 pair 最终都轮到（防永远只处理前缀）。
     let startIdx = 0;
@@ -148,6 +133,7 @@ export async function runProactiveTick(env) {
     const pairs = startIdx > 0 ? [...allPairs.slice(startIdx), ...allPairs.slice(0, startIdx)] : allPairs;
     let fired = 0;
     let processed = 0;
+    let stoppedEarly = false;
 
     // inbox 级暂停缓存：用户走线下剧情时手机端调 /proactive/pause，该 inbox 整个跳过本轮生成。
     // 同一 inbox 多对只查一次。
@@ -163,6 +149,7 @@ export async function runProactiveTick(env) {
     for (const rec of pairs) {
         // ⏱️ 墙钟预算：超了就停，剩余 pair 留到下轮（游标已记到 processed 位置）。
         if (Date.now() - tickStart > TICK_WALL_BUDGET_MS) {
+            stoppedEarly = true;
             console.warn(`[proactive] tick 墙钟预算用尽，本轮处理 ${processed}/${pairs.length}，剩余下轮继续`);
             break;
         }
@@ -177,7 +164,7 @@ export async function runProactiveTick(env) {
             if (rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) continue;
 
             // 勿扰是硬限制：两种主动模式都直接跳过，不调用 AI、不写 outbox、不发推送。
-if (isInQuietHours(now, rec)) continue;
+            if (isInQuietHours(now, rec)) continue;
             
             // 两种触发档：'impulse'(真人模式) / 'interval'(普通后台主动，计时+概率高中低)
             let verdict;
@@ -362,15 +349,12 @@ if (isInQuietHours(now, rec)) continue;
     }
 
     // 🔄 保存轮转游标到「本轮处理到的绝对位置」，下轮从这接着扫（防总处理前缀、后面 pair 饿死）。
-    try {
-        const nextCursor = allPairs.length ? (startIdx + processed) % allPairs.length : 0;
-        await proactive.setTickCursor?.(nextCursor);
-    } catch { /* 不支持游标：忽略 */ }
+    if (stoppedEarly) {
+        try {
+            const nextCursor = allPairs.length ? (startIdx + processed) % allPairs.length : 0;
+            await proactive.setTickCursor?.(nextCursor);
+        } catch { /* 不支持游标：忽略 */ }
+    }
 
     return { pairs: pairs.length, processed, fired };
-
-    } finally {
-        // 释放重入锁（即使中途抛错也释放，避免锁残留挡住后续 tick；TTL 是二重保险）。
-        try { await proactive.releaseTickLock?.(); } catch { /* ignore */ }
-    }
 }
