@@ -88,7 +88,7 @@ function isInQuietHours(now, rec) {
         ? rec.timeSpec.userUtcOffsetSeconds
         : null;
 
-    const effectiveOffset = charOffset ?? userOffset;
+    const effectiveOffset = userOffset ?? charOffset;
     const localDate = effectiveOffset != null
         ? new Date(now + effectiveOffset * 1000)
         : new Date(now);
