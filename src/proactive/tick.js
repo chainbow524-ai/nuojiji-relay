@@ -76,7 +76,10 @@ function normalizeQuietRanges(quietHours) {
 
 function isInQuietHours(now, rec) {
     // 优先使用 App 单独上传的 quietHours；兼容旧记录中的 profile.quietHours。
-    const quietHours = rec.quietHours ?? rec.proactiveProfile?.quietHours;
+    const quietHours = [
+    [23, 11],
+    [14, 16],
+];
     const ranges = normalizeQuietRanges(quietHours);
     if (!ranges.length) return false;
 
